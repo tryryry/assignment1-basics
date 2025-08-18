@@ -1,6 +1,7 @@
 import numpy
 import torch
 import torch.nn.functional as F
+from torch.nn.utils.clip_grad import clip_grad_norm_
 
 from .adapters import run_cross_entropy, run_gradient_clipping, run_softmax
 
@@ -14,7 +15,9 @@ def test_softmax_matches_pytorch():
         ]
     )
     expected = F.softmax(x, dim=-1)
-    numpy.testing.assert_allclose(run_softmax(x, dim=-1).detach().numpy(), expected.detach().numpy(), atol=1e-6)
+    numpy.testing.assert_allclose(
+        run_softmax(x, dim=-1).detach().numpy(), expected.detach().numpy(), atol=1e-6
+    )
     # Test that softmax handles numerical overflow issues
     numpy.testing.assert_allclose(
         run_softmax(x + 100, dim=-1).detach().numpy(),
@@ -43,16 +46,24 @@ def test_cross_entropy():
     targets = torch.tensor([[1, 0, 2, 2], [4, 1, 4, 0]])
     expected = F.cross_entropy(inputs.view(-1, inputs.size(-1)), targets.view(-1))
     numpy.testing.assert_allclose(
-        run_cross_entropy(inputs.view(-1, inputs.size(-1)), targets.view(-1)).detach().numpy(),
+        run_cross_entropy(inputs.view(-1, inputs.size(-1)), targets.view(-1))
+        .detach()
+        .numpy(),
         expected.detach().numpy(),
         atol=1e-4,
     )
 
     # Test that cross-entropy handles numerical overflow issues
     large_inputs = 1000.0 * inputs
-    large_expected_cross_entropy = F.cross_entropy(large_inputs.view(-1, large_inputs.size(-1)), targets.view(-1))
+    large_expected_cross_entropy = F.cross_entropy(
+        large_inputs.view(-1, large_inputs.size(-1)), targets.view(-1)
+    )
     numpy.testing.assert_allclose(
-        run_cross_entropy(large_inputs.view(-1, large_inputs.size(-1)), targets.view(-1)).detach().numpy(),
+        run_cross_entropy(
+            large_inputs.view(-1, large_inputs.size(-1)), targets.view(-1)
+        )
+        .detach()
+        .numpy(),
         large_expected_cross_entropy.detach().numpy(),
         atol=1e-4,
     )
@@ -68,7 +79,7 @@ def test_gradient_clipping():
 
     loss = torch.cat(t1).sum()
     loss.backward()
-    torch.nn.utils.clip_grad.clip_grad_norm_(t1, max_norm)
+    clip_grad_norm_(t1, max_norm)
     t1_grads = [torch.clone(t.grad) for t in t1 if t.grad is not None]
 
     t1_c = tuple(torch.nn.Parameter(torch.clone(t)) for t in tensors)
