@@ -1,6 +1,7 @@
 import os
+import re
 from typing import BinaryIO
-
+from multiprocessing import Pool
 
 def find_chunk_boundaries(
     file: BinaryIO,
@@ -50,15 +51,32 @@ def find_chunk_boundaries(
     # Make sure all boundaries are unique, but might be fewer than desired_num_chunks
     return sorted(set(chunk_boundaries))
 
-def bpf_tokenize(
-     chunk: bytes   
-) 
+def chunk_tokenize(
+    chunk: str,
+    special_tokens: list[str]
+) -> dict[str, int]:
+   pattern = "|".join(re.escape(tok) for tok in special_tokens);
+   split_chunks = re.split(pattern, chunk)
+   PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+   pre_token_count = {}
+   for split_chunk in split_chunks:
+       for m in re.finditer(PAT, split_chunk):
+            pre_token_count[m.group()] += 1  
+   return pre_token_count
 
 def train_bpe(
     input_path: str,
     vocab_size: int,
     special_tokens: list[str]
 ) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
+    vocab = {}
+    for i in range(256):
+        vocab[i] = bytes([1])
+    for i, token in enumerate(special_tokens):
+        vocab[256 + i] = token.encode("utf8")
+    
+    merges = []
+    pre_token_count = {}
     ## Usage
     with open(input_path, "rb") as f:
         num_processes = 4
@@ -70,7 +88,13 @@ def train_bpe(
             f.seek(start)
             chunk = f.read(end - start).decode("utf-8", errors="ignore")
             # Run pre-tokenization on your chunk and store the counts for each pre-token
-
+            results = {}
+            with Pool(processes=num_processes) as pool:
+               results = pool.startmap(chunk_tokenize, args=(chunk, special_tokens))
+            for local_res in results:
+                for token, count in local_res:
+                    pre_token_count[token] = pre_token_count.get(token, 0) + count
+    
     return 1,1
 
 
