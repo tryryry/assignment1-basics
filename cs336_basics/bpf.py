@@ -1,7 +1,8 @@
 import os
-import re
+import regex as re
 from typing import BinaryIO
 from multiprocessing import Pool
+from collections import defaultdict
 
 def find_chunk_boundaries(
     file: BinaryIO,
@@ -61,8 +62,65 @@ def chunk_tokenize(
    pre_token_count = {}
    for split_chunk in split_chunks:
        for m in re.finditer(PAT, split_chunk):
-            pre_token_count[m.group()] += 1  
+            pre_token_count[m.group()] = pre_token_count.get(m.group(), 0) + 1  
    return pre_token_count
+
+def bpe_algorithm(
+    pre_token_count: dict,
+    vocab: dict,
+    vocab_size: int,
+) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
+    merge = []
+    pair_counts = {}
+    word_tokens = defaultdict(list)
+    pair_to_words = defaultdict(set) 
+    word_id = 0
+    word_freq = {}
+    for word_id, (token, count) in enumerate(pre_token_count.items()):
+        tokens = [bytes([b]) for b in token.encode("utf-8")] 
+        word_tokens[word_id] = tokens
+        word_freq[word_id] = count  
+        for i in range(len(tokens) - 1):
+            pair = (tokens[i], tokens[i+1])
+            pair_counts[pair] = pair_counts.get(pair, 0) + count  
+            pair_to_words[pair].add(word_id) 
+
+    print(word_tokens[0], word_freq[0])                                       
+    print(dict(list(pair_counts.items())[:5])) 
+
+    for i in range(10):
+        max_pair = max(pair_counts, key=pair_counts.get)
+        vocab[len(vocab)] = max_pair.get(0) + max_pair.get(1)
+        merge.append(max_pair)
+        for word_id in pair_to_words[max_pair]:
+            length = len(word_tokens[word_id])
+            new_list = []
+            pair_i = []
+            for i in range(length):
+                if i < length and word_tokens[i] == max_pair.get(0) and word_tokens[i + 1] == max_pair.get(1):
+                    pair_i.append(i)
+                    i = i + 2
+                else:
+                    new_list.append(word_tokens[i])
+                    i = i + 1
+            for i,index in enumerate(pair_i):
+                new_list.append(word_tokens[i] + word_tokens[i + 1])
+                if i > 0:
+                    new_pair = (word_tokens[i - 1], word_tokens[i] + word_tokens[i + 1])
+                    old_pair = (word_tokens[i - 1], word_tokens[i])
+                    pair_counts[old_pair] = pair_counts.get(old_pair) - pre_token_count_index[word_id]
+                    pair_counts[new_pair] = pair_counts.get(new_pair, 0) + pre_token_count_index[word_id]
+                    pair_to_words[new_pair].append(word_id)
+                if i + 2 < length and index + 1 < len(pair_i) and i + 1 != pair_i[index + 1]:
+                    new_pair = (word_tokens[i] + word_tokens[i + 1], word_tokens[i + 2])
+                    old_pair = (word_tokens[i + 1], word_tokens[i + 1])
+                    pair_counts[old_pair] = pair_counts.get(old_pair) - pre_token_count_index[word_id]
+                    pair_counts[new_pair] = pair_counts.get(new_pair, 0) + pre_token_count_index[word_id]
+                    pair_to_words[new_pair].append(word_id)
+            word_tokens[word_id] = new_list
+        del pair_counts[max_pair]
+        del pair_to_words[max_pair]
+    return vocab, merge
 
 def train_bpe(
     input_path: str,
@@ -74,28 +132,29 @@ def train_bpe(
         vocab[i] = bytes([1])
     for i, token in enumerate(special_tokens):
         vocab[256 + i] = token.encode("utf8")
-    
-    merges = []
+
     pre_token_count = {}
     ## Usage
     with open(input_path, "rb") as f:
         num_processes = 4
         boundaries = find_chunk_boundaries(f, num_processes, b"<|endoftext|>")
-
-        # The following is a serial implementation, but you can parallelize this
-        # by sending each start/end pair to a set of processes.
+        chunks = []
         for start, end in zip(boundaries[:-1], boundaries[1:]):
             f.seek(start)
             chunk = f.read(end - start).decode("utf-8", errors="ignore")
-            # Run pre-tokenization on your chunk and store the counts for each pre-token
-            results = {}
-            with Pool(processes=num_processes) as pool:
-               results = pool.startmap(chunk_tokenize, args=(chunk, special_tokens))
-            for local_res in results:
-                for token, count in local_res:
-                    pre_token_count[token] = pre_token_count.get(token, 0) + count
-    
-    return 1,1
+            chunks.append(chunk)
+
+        results = {}
+        args = [(chunk, special_tokens) for chunk in chunks]
+        with Pool(processes=num_processes) as pool:
+            results = pool.starmap(chunk_tokenize, args)
+
+        for local_res in results:
+            for token, count in local_res.items():
+                pre_token_count[token] = pre_token_count.get(token, 0) + count
+    for token, count in pre_token_count.items():
+       print(f"Token: {token}, Count: {count}")
+    return bpe_algorithm(pre_token_count, vocab, vocab_size)
 
 
 
