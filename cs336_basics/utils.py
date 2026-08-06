@@ -2,13 +2,17 @@ import torch
 from torch import Tensor
 from jaxtyping import Float, Int
 from einops import einsum
+from einops import rearrange
 
 
 class Linear(torch.nn.Module):
 
     def __init__(self, in_features, out_features, device=None, dtype=None):
         super().__init__()
-        self.w = torch.nn.Parameter(torch.empty(out_features, in_features))
+        factory_kwargs = {"device": device, "dtype": dtype}
+        self.w = torch.nn.Parameter(
+            torch.empty(out_features, in_features, **factory_kwargs)
+        )
         torch.nn.init.trunc_normal_(self.w)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -18,7 +22,10 @@ class Linear(torch.nn.Module):
 class Embedding(torch.nn.Module):
     def __init__(self, num_embeddings, embedding_dim, device=None, dtype=None):
         super().__init__()
-        self.embedding = torch.nn.Parameter(torch.empty(num_embeddings, embedding_dim))
+        factory_kwargs = {"device": device, "dtype": dtype}
+        self.embedding = torch.nn.Parameter(
+            torch.empty(num_embeddings, embedding_dim, **factory_kwargs)
+        )
         torch.nn.init.trunc_normal_(self.embedding)
 
     def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
@@ -30,7 +37,8 @@ class RMSNorm(torch.nn.Module):
         super().__init__()
         self.d_model = d_model
         self.eps = eps
-        self.g = torch.nn.Parameter(torch.empty(d_model))
+        factory_kwargs = {"device": device, "dtype": dtype}
+        self.g = torch.nn.Parameter(torch.empty(d_model, **factory_kwargs))
         torch.nn.init.trunc_normal_(self.g)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -42,54 +50,42 @@ class RMSNorm(torch.nn.Module):
 
 
 class Swiglu(torch.nn.Module):
-    def __init__(self, d_modle: int, d_ff: int):
+    def __init__(self, d_model: int, d_ff: int, device=None, dtype=None):
         super().__init__()
-        self.d_modle = d_modle
-        self.d_ff = d_ff
+        self.w1 = Linear(d_model, d_ff, device, dtype)
+        self.w3 = Linear(d_model, d_ff, device, dtype)
+        self.w2 = Linear(d_ff, d_model, device, dtype)
 
     def forward(
         self,
-        in_features: Float[Tensor, " ... d_model"],
-        w1_weight: Float[Tensor, " d_ff d_model"],
-        w2_weight: Float[Tensor, " d_model d_ff"],
-        w3_weight: Float[Tensor, " d_ff d_model"],
+        x: Float[Tensor, " ... d_model"],
     ):
-        # W1 @ x
-        linear1 = Linear(self.d_modle, self.d_ff)
-        linear1.load_state_dict({"w": w1_weight})
-        x1 = linear1.forward(in_features)
-        # SiLu(x)
-        x1 = x1 * torch.sigmoid(x1)
-        # W3 @ x
-        linear3 = Linear(self.d_modle, self.d_ff)
-        linear3.load_state_dict({"w": w3_weight})
-        x3 = linear3.forward(in_features)
-        x = x1 * x3
-        # W2 @ x
-        linear2 = Linear(self.d_ff, self.d_modle)
-        linear2.load_state_dict({"w": w2_weight})
-        return linear2(x)
+        z = self.w1(x)
+        return self.w2(torch.sigmoid(z) * z * self.w3(x))
 
 
-def RotaryPositionalEmbedding(
-    theta: float,
-    d_k: int,
-    max_seq_len: int,
-    x: torch.Tensor,
-    token_positions: torch.Tensor,
-) -> torch.Tensor:
-    freq = theta ** (-torch.arange(0, d_k, 2) / d_k)
-    angles = token_positions[..., None] * freq
-    cos = torch.cos(angles)
-    sin = torch.sin(angles)
-    x_even = x[..., 0::2]
-    x_odd = x[..., 1::2]
-    x_rot_even = x_even * cos - x_odd * sin
-    x_rot_odd = x_even * sin + x_odd * cos
-    return torch.stack(
-        (x_rot_even, x_rot_odd),
-        dim=-1,
-    ).flatten(-2)
+class Rope(torch.nn.Module):
+    def __init__(self, theta: float, d_k: int, max_seq_len: int, device=None):
+        super().__init__()
+        self.theta = theta
+        self.d_k = d_k
+        self.max_seq_len = max_seq_len
+        freq = self.theta ** (
+            -torch.arange(0, self.d_k, 2, device=device) / self.d_k
+        )  # (d_k/2, )
+        positions = torch.arange(max_seq_len, device=device)  # (max_seq_len, )
+        angles = positions[..., None] * freq  # (max_seq_len, d_k/2)
+        self.register_buffer("cos", torch.cos(angles), persistent=False)
+        self.register_buffer("sin", torch.sin(angles), persistent=False)
+
+    def forward(self, x: torch.Tensor, token_positions: torch.Tensor) -> torch.Tensor:
+        x_even = x[..., 0::2]
+        x_odd = x[..., 1::2]
+        cos = self.cos[token_positions]
+        sin = self.sin[token_positions]
+        x_rot_even = x_even * cos - x_odd * sin
+        x_rot_odd = x_even * sin + x_odd * cos
+        return torch.stack((x_rot_even, x_rot_odd), dim=-1).flatten(-2)
 
 
 def Softmax(in_features: Float[Tensor, " ..."], dim: int):
@@ -110,3 +106,57 @@ def Scaled_dot_product_attention(
     scores = scores.masked_fill(~mask, float("-inf"))
     attention = Softmax(scores, -1)
     return einsum(attention, V, "... queries keys, ... keys d_v -> ... queries d_v")
+
+
+class MultiHeadAttention(torch.nn.Module):
+    def __init__(
+        self,
+        d_in: int,
+        d_model: int,
+        num_heads: int,
+        max_seq_len: int | None = None,
+        theta: float | None = None,
+        d_k=None,
+        d_v=None,
+    ):
+        super().__init__()
+
+        self.max_seq_len = max_seq_len
+        self.theta = theta
+        self.d_k = d_k if d_k is not None else d_model
+        self.d_v = d_v if d_v is not None else d_model
+
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.q_proj = Linear(d_in, self.d_k)
+        self.k_proj = Linear(d_in, self.d_k)
+        self.v_proj = Linear(d_in, self.d_v)
+        self.o_proj = Linear(self.d_v, d_model)
+        if max_seq_len is not None:
+            self.rope = Rope(
+                theta=theta, d_k=self.d_k // num_heads, max_seq_len=max_seq_len
+            )
+        else:
+            self.rope = None
+
+    def forward(
+        self,
+        x: Float[Tensor, " ... sequence_length d_in"],
+        token_positions: Int[Tensor, " ... sequence_length"] | None = None,
+    ):
+        Q = self.q_proj(x)
+        K = self.k_proj(x)
+        V = self.v_proj(x)
+        Q = rearrange(Q, "... seq (h d) -> ... h seq d", h=self.num_heads)
+        K = rearrange(K, "... seq (h d) -> ... h seq d", h=self.num_heads)
+        V = rearrange(V, "... seq (h d) -> ... h seq d", h=self.num_heads)
+        if token_positions is not None and self.rope is not None:
+            Q = self.rope(Q, token_positions)
+            K = self.rope(K, token_positions)
+        seq = x.shape[-2]
+        mask = torch.tril(
+            torch.ones(seq, seq, dtype=torch.bool, device=x.device), diagonal=0
+        )
+        O_Att = Scaled_dot_product_attention(Q, K, V, mask)
+        O_Att = rearrange(O_Att, "... h seq d -> ... seq (h d)")
+        return self.o_proj(O_Att)

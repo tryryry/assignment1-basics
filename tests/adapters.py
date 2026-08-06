@@ -13,9 +13,10 @@ from cs336_basics.utils import (
     Embedding,
     RMSNorm,
     Swiglu,
-    RotaryPositionalEmbedding,
+    Rope,
     Softmax,
     Scaled_dot_product_attention,
+    MultiHeadAttention,
 )
 from cs336_basics.train_bpe import train_bpe
 from cs336_basics.tokenizer import tokenizer
@@ -100,7 +101,8 @@ def run_swiglu(
     # swiglu.w3.weight.data = w3_weight
     # raise NotImplementedError
     swiglu = Swiglu(d_model, d_ff)
-    return swiglu(in_features, w1_weight, w2_weight, w3_weight)
+    swiglu.load_state_dict({"w1.w": w1_weight, "w2.w": w2_weight, "w3.w": w3_weight})
+    return swiglu(in_features)
 
 
 def run_scaled_dot_product_attention(
@@ -155,7 +157,22 @@ def run_multihead_self_attention(
         Float[Tensor, " ... sequence_length d_out"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
+    multiHeadAttention = MultiHeadAttention(
+        d_in=q_proj_weight.shape[-1],
+        d_model=d_model,
+        num_heads=num_heads,
+        d_k=q_proj_weight.shape[-2],
+        d_v=o_proj_weight.shape[-1],
+    )
+    multiHeadAttention.load_state_dict(
+        {
+            "q_proj.w": q_proj_weight,
+            "k_proj.w": k_proj_weight,
+            "v_proj.w": v_proj_weight,
+            "o_proj.w": o_proj_weight,
+        }
+    )
+    return multiHeadAttention(x=in_features)
 
 
 def run_multihead_self_attention_with_rope(
@@ -195,7 +212,25 @@ def run_multihead_self_attention_with_rope(
         Float[Tensor, " ... sequence_length d_out"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
+
+    multiHeadAttention = MultiHeadAttention(
+        d_in=q_proj_weight.shape[-1],
+        d_model=d_model,
+        num_heads=num_heads,
+        max_seq_len=max_seq_len,
+        theta=theta,
+        d_k=q_proj_weight.shape[-2],
+        d_v=o_proj_weight.shape[-1],
+    )
+    multiHeadAttention.load_state_dict(
+        {
+            "q_proj.w": q_proj_weight,
+            "k_proj.w": k_proj_weight,
+            "v_proj.w": v_proj_weight,
+            "o_proj.w": o_proj_weight,
+        }
+    )
+    return multiHeadAttention(x=in_features, token_positions=token_positions)
 
 
 def run_rope(
@@ -217,13 +252,8 @@ def run_rope(
     Returns:
         Float[Tensor, " ... sequence_length d_k"]: Tensor with RoPEd input.
     """
-    return RotaryPositionalEmbedding(
-        theta=theta,
-        d_k=d_k,
-        max_seq_len=max_seq_len,
-        x=in_query_or_key,
-        token_positions=token_positions,
-    )
+    rope = Rope(theta=theta, d_k=d_k, max_seq_len=max_seq_len)
+    return rope(in_query_or_key, token_positions)
 
 
 def run_transformer_block(
