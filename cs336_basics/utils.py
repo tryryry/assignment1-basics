@@ -120,11 +120,10 @@ class MultiHeadAttention(torch.nn.Module):
         d_v=None,
     ):
         super().__init__()
-
         self.max_seq_len = max_seq_len
         self.theta = theta
-        self.d_k = d_k if d_k is not None else d_model
-        self.d_v = d_v if d_v is not None else d_model
+        self.d_k = d_k if d_k is not None else d_model 
+        self.d_v = d_v if d_v is not None else d_model 
 
         self.d_model = d_model
         self.num_heads = num_heads
@@ -160,3 +159,20 @@ class MultiHeadAttention(torch.nn.Module):
         O_Att = Scaled_dot_product_attention(Q, K, V, mask)
         O_Att = rearrange(O_Att, "... h seq d -> ... seq (h d)")
         return self.o_proj(O_Att)
+    
+class TransformerBlock(torch.nn.Module):
+    def __init__(self, d_model: int, num_heads: int, d_ff: int, max_seq_len: int, theta: float):
+        super().__init__()
+        
+        self.attn = MultiHeadAttention(d_in=d_model, d_model=d_model, num_heads=num_heads, max_seq_len=max_seq_len, theta=theta)
+        self.ln1 = RMSNorm(d_model=d_model)
+        self.ln2 = RMSNorm(d_model=d_model)
+        self.ffn= Swiglu(d_model=d_model, d_ff=d_ff)
+
+    def forward(self, x: Float[Tensor, " batch sequence_length d_model"]):
+        token_positions = torch.arange(x.shape[-2],device=x.device,)
+        x = x + self.attn(self.ln1(x), token_positions)
+        return x + self.ffn(self.ln2(x))
+    
+class TransformerLM(torch.nn.Module):
+    def __init__()

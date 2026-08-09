@@ -17,6 +17,7 @@ from cs336_basics.utils import (
     Softmax,
     Scaled_dot_product_attention,
     MultiHeadAttention,
+    TransformerBlock,
 )
 from cs336_basics.train_bpe import train_bpe
 from cs336_basics.tokenizer import tokenizer
@@ -326,7 +327,27 @@ def run_transformer_block(
         Float[Tensor, "batch sequence_length d_model"] Tensor with the output of
         running the Transformer block on the input features while using RoPE.
     """
-    raise NotImplementedError
+    transformerBlock = TransformerBlock(
+        d_model=d_model,
+        num_heads=num_heads,
+        d_ff=d_ff,
+        max_seq_len=max_seq_len,
+        theta=theta,
+    )
+    transformerBlock.load_state_dict(
+        {
+            "attn.q_proj.w": weights["attn.q_proj.weight"],
+            "attn.k_proj.w": weights["attn.k_proj.weight"],
+            "attn.v_proj.w": weights["attn.v_proj.weight"],
+            "attn.o_proj.w": weights["attn.output_proj.weight"],
+            "ln1.g": weights["ln1.weight"],
+            "ln2.g": weights["ln2.weight"],
+            "ffn.w1.w": weights["ffn.w1.weight"],
+            "ffn.w2.w": weights["ffn.w2.weight"],
+            "ffn.w3.w": weights["ffn.w3.weight"],
+        }
+    )
+    return transformerBlock(in_features)
 
 
 def run_transformer_lm(
