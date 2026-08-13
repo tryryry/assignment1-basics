@@ -16,7 +16,7 @@ class Linear(torch.nn.Module):
         torch.nn.init.trunc_normal_(self.w)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x @ self.w.T
+        return torch.matmul(x, self.w.transpose(-2, -1))
 
 
 class Embedding(torch.nn.Module):
@@ -122,8 +122,8 @@ class MultiHeadAttention(torch.nn.Module):
         super().__init__()
         self.max_seq_len = max_seq_len
         self.theta = theta
-        self.d_k = d_k if d_k is not None else d_model 
-        self.d_v = d_v if d_v is not None else d_model 
+        self.d_k = d_k if d_k is not None else d_model
+        self.d_v = d_v if d_v is not None else d_model
 
         self.d_model = d_model
         self.num_heads = num_heads
@@ -159,20 +159,69 @@ class MultiHeadAttention(torch.nn.Module):
         O_Att = Scaled_dot_product_attention(Q, K, V, mask)
         O_Att = rearrange(O_Att, "... h seq d -> ... seq (h d)")
         return self.o_proj(O_Att)
-    
+
+
 class TransformerBlock(torch.nn.Module):
-    def __init__(self, d_model: int, num_heads: int, d_ff: int, max_seq_len: int, theta: float):
+    def __init__(
+        self, d_model: int, num_heads: int, d_ff: int, max_seq_len: int, theta: float
+    ):
         super().__init__()
-        
-        self.attn = MultiHeadAttention(d_in=d_model, d_model=d_model, num_heads=num_heads, max_seq_len=max_seq_len, theta=theta)
+
+        self.attn = MultiHeadAttention(
+            d_in=d_model,
+            d_model=d_model,
+            num_heads=num_heads,
+            max_seq_len=max_seq_len,
+            theta=theta,
+        )
         self.ln1 = RMSNorm(d_model=d_model)
         self.ln2 = RMSNorm(d_model=d_model)
-        self.ffn= Swiglu(d_model=d_model, d_ff=d_ff)
+        self.ffn = Swiglu(d_model=d_model, d_ff=d_ff)
 
     def forward(self, x: Float[Tensor, " batch sequence_length d_model"]):
-        token_positions = torch.arange(x.shape[-2],device=x.device,)
+        token_positions = torch.arange(
+            x.shape[-2],
+            device=x.device,
+        )
         x = x + self.attn(self.ln1(x), token_positions)
         return x + self.ffn(self.ln2(x))
-    
+
+
 class TransformerLM(torch.nn.Module):
-    def __init__()
+    def __init__(
+        self,
+        vocab_size: int,
+        context_length: int,
+        d_model: int,
+        num_layers: int,
+        num_heads: int,
+        d_ff: int,
+        rope_theta: float,
+    ):
+        super().__init__()
+
+        self.embedding = Embedding(vocab_size, d_model)
+        self.num_layers = num_layers
+        self.block = torch.nn.ModuleList(
+            [
+                TransformerBlock(
+                    d_model=d_model,
+                    num_heads=num_heads,
+                    d_ff=d_ff,
+                    max_seq_len=context_length,
+                    theta=rope_theta,
+                )
+                for _ in range(num_layers)
+            ]
+        )
+
+        self.ln_final = RMSNorm(d_model=d_model)
+        self.lm_head = Linear(d_model, vocab_size)
+
+    def forward(self, in_indices: Int[Tensor, " batch_size sequence_length"]):
+        embedding = self.embedding(in_indices)
+        output = embedding
+        for i in range(self.num_layers):
+            input = output
+            output = self.block[i](input)
+        return self.lm_head(self.ln_final(output))
