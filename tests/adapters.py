@@ -8,7 +8,7 @@ from jaxtyping import Float, Int
 import numpy.typing as npt
 import torch
 from torch import Tensor
-from cs336_basics.utils import (
+from cs336_basics.transformer import (
     Linear,
     Embedding,
     RMSNorm,
