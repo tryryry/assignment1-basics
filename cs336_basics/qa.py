@@ -42,10 +42,10 @@ def gqa_attention(q:Tensor, k: Tensor, v: Tensor, causal: bool) -> Tensor:
     k, v = expand_kv_for_gqa(k, v, H_q)
     
     # att
-    score = torch.matmul(q, k.transpose(-2, -1)) / (H_kv ** 0.5)
+    score = torch.matmul(q, k.transpose(-2, -1)) / (D ** 0.5)
     if causal:
         mask = torch.ones(S, S).triu(diagonal=1)
-        score.masked_fill(mask, float("-inf"))
+        score = score.masked_fill(mask, float("-inf"))
     att= torch.softmax(score, dim=-1)
     out = torch.matmul(att, v)
     
@@ -66,6 +66,37 @@ def gqa_attention(q:Tensor, k: Tensor, v: Tensor, causal: bool) -> Tensor:
 #   为便于判分，用 from_full() 从「完整权重」按 rank 切片构造；
 #   各 rank forward 后做 all_reduce（或单进程下把各 rank 输出相加）应 == 单卡整权重前向。
 # ============================================================
-class TPAttention(torch.nn.modules):
-    def forward(hidden_states: Tensor):
-        
+class TPAttention(torch.nn.Module):
+    def __init__(self, num_q_heads, num_kv_heads, head_dim, tp_size, rank, causal):
+        super().__init__()
+        self.num_q_heads = num_q_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = head_dim
+        self.tp_size= tp_size
+        self.rank = rank
+        self.causal = causal
+        self.local_q_heads = num_q_heads // tp_size
+        if num_kv_heads > tp_size:
+            self.local_kv_heads = num_kv_heads // tp_size
+        else:
+            self.local_kv_heads = 1
+
+        hidden_size = num_q_heads * head_dim
+        self.local_q_size = self.local_q_heads * head_dim
+        self.local_kv_size = self.local_kv_heads * head_dim
+        self.q_proj = torch.nn.Parameter(torch.empty(self.local_q_size, hidden_size))
+        self.k_proj = torch.nn.Parameter(torch.empty(self.local_kv_size, hidden_size))
+        self.v_proj = torch.nn.Parameter(torch.empty(self.local_kv_size, hidden_size))
+        self.o_proj = torch.nn.Parameter(torch.empty(hidden_size, self.local_q_size))
+
+    def forward(self, hidden_states: Tensor):
+        B, S, hidden_size = hidden_states.shape
+        Q = torch.matmul(hidden_states, self.q_proj.transpose(-1, -2))
+        K = torch.matmul(hidden_states, self.k_proj.transpose(-1, -2))
+        V = torch.matmul(hidden_states, self.v_proj.transpose(-1, -2))
+        Q = Q.reshape(B, S, self.local_q_heads, self.head_dim).transpose(1, 2)
+        K = K.reshape(B, S, self.local_kv_heads, self.head_dim).transpose(1, 2)
+        V = V.reshape(B, S, self.local_kv_heads, self.head_dim).transpose(1, 2)
+
+        out = gqa_attention(Q, K, V, self.causal)
+        return torch.matmul(out.transpose(1, 2).reshape(B, S, self.local_q_size), self.o_proj.transpose(-1, -2))
