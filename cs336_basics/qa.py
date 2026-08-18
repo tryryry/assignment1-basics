@@ -69,6 +69,7 @@ def gqa_attention(q:Tensor, k: Tensor, v: Tensor, causal: bool) -> Tensor:
 class TPAttention(torch.nn.Module):
     def __init__(self, num_q_heads, num_kv_heads, head_dim, tp_size, rank, causal):
         super().__init__()
+
         self.num_q_heads = num_q_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
@@ -88,6 +89,16 @@ class TPAttention(torch.nn.Module):
         self.k_proj = torch.nn.Parameter(torch.empty(self.local_kv_size, hidden_size))
         self.v_proj = torch.nn.Parameter(torch.empty(self.local_kv_size, hidden_size))
         self.o_proj = torch.nn.Parameter(torch.empty(hidden_size, self.local_q_size))
+
+    # q_weight [H_q, D, h]
+    @classmethod
+    def from_full(cls, q_weight, k_weight, v_weight, o_weight, num_q_heads, num_kv_heads, head_dim, tp_size, rank, causal):
+        module = cls(num_q_heads, num_kv_heads, head_dim, tp_size, rank, causal)
+        q_start = rank * module.local_q_heads
+        q_end = q_start + module.local_q_heads  
+        q_weight_split = q_weight[q_start:q_end]
+
+        return module
 
     def forward(self, hidden_states: Tensor):
         B, S, hidden_size = hidden_states.shape
