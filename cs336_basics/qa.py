@@ -20,36 +20,39 @@ from torch import Tensor
 #     返回 [B, H_q, S, D]
 # ============================================================
 
+
 # 8a
 def expand_kv_for_gqa(k: Tensor, v: Tensor, num_q_heads: int) -> Tuple[Tensor, Tensor]:
     G = num_q_heads // k.shape(1)
-    k = k.unsqueeze(2) # [B, H_kv, S, D] -> [B, H_kv, 1,  S, D]
-    k = k.expand(-1, -1, G, -1, -1) # [B, H_kv, 1,  S, D] -> [B, H_kv, G,  S, D] 
+    k = k.unsqueeze(2)  # [B, H_kv, S, D] -> [B, H_kv, 1,  S, D]
+    k = k.expand(-1, -1, G, -1, -1)  # [B, H_kv, 1,  S, D] -> [B, H_kv, G,  S, D]
     v = v.unsqueeze(2)
-    v = v.expand(-1, -1, G, -1, -1) 
+    v = v.expand(-1, -1, G, -1, -1)
     return k, v
+
 
 # 8b
 # G = 4
 # Q 头 0~3   → KV 头 0
 # Q 头 4~7   → KV 头 1
-def gqa_attention(q:Tensor, k: Tensor, v: Tensor, causal: bool) -> Tensor:
+def gqa_attention(q: Tensor, k: Tensor, v: Tensor, causal: bool) -> Tensor:
     B, H_q, S, D = q.shape
     H_kv = k.shape(1)
     G = H_q // H_kv
-    q = q.view(B, H_kv, G, S, D) # [B, H_q, S, D] -> [B, H_kv, G, S, D] 
-    
+    q = q.view(B, H_kv, G, S, D)  # [B, H_q, S, D] -> [B, H_kv, G, S, D]
+
     k, v = expand_kv_for_gqa(k, v, H_q)
-    
+
     # att
-    score = torch.matmul(q, k.transpose(-2, -1)) / (D ** 0.5)
+    score = torch.matmul(q, k.transpose(-2, -1)) / (D**0.5)
     if causal:
         mask = torch.ones(S, S).triu(diagonal=1)
         score = score.masked_fill(mask, float("-inf"))
-    att= torch.softmax(score, dim=-1)
+    att = torch.softmax(score, dim=-1)
     out = torch.matmul(att, v)
-    
+
     return out.view(B, H_q, S, D)
+
 
 # ============================================================
 # 题 8c：张量并行的 Attention 模块（一个完整 attention block）
@@ -71,32 +74,42 @@ class TPAttention(torch.nn.Module):
         super().__init__()
 
         self.num_q_heads = num_q_heads
-        self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
-        self.tp_size= tp_size
+        self.tp_size = tp_size
         self.rank = rank
         self.causal = causal
         self.local_q_heads = num_q_heads // tp_size
-        if num_kv_heads > tp_size:
-            self.local_kv_heads = num_kv_heads // tp_size
-        else:
-            self.local_kv_heads = 1
 
         hidden_size = num_q_heads * head_dim
         self.local_q_size = self.local_q_heads * head_dim
-        self.local_kv_size = self.local_kv_heads * head_dim
         self.q_proj = torch.nn.Parameter(torch.empty(self.local_q_size, hidden_size))
-        self.k_proj = torch.nn.Parameter(torch.empty(self.local_kv_size, hidden_size))
-        self.v_proj = torch.nn.Parameter(torch.empty(self.local_kv_size, hidden_size))
+        self.k_proj = torch.nn.Parameter(torch.empty(self.local_q_size, hidden_size))
+        self.v_proj = torch.nn.Parameter(torch.empty(self.local_q_size, hidden_size))
         self.o_proj = torch.nn.Parameter(torch.empty(hidden_size, self.local_q_size))
 
-    # q_weight [H_q, D, h]
+    # q_weight [H_q, D, h] o_weight [h, H_q, D]
     @classmethod
-    def from_full(cls, q_weight, k_weight, v_weight, o_weight, num_q_heads, num_kv_heads, head_dim, tp_size, rank, causal):
+    def from_full(
+        cls,
+        q_weight,
+        k_weight,
+        v_weight,
+        o_weight,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        tp_size,
+        rank,
+        causal,
+    ):
         module = cls(num_q_heads, num_kv_heads, head_dim, tp_size, rank, causal)
         q_start = rank * module.local_q_heads
-        q_end = q_start + module.local_q_heads  
+        q_end = q_start + module.local_q_heads
         q_weight_split = q_weight[q_start:q_end]
+        k_weight_split = k_weight[q_start:q_end]
+        v_weight_split = v_weight[q_start:q_end]
+
+        o_weight_split = o_weight[:, q_start:q_end, D]
 
         return module
 
@@ -110,12 +123,16 @@ class TPAttention(torch.nn.Module):
         V = V.reshape(B, S, self.local_kv_heads, self.head_dim).transpose(1, 2)
 
         out = gqa_attention(Q, K, V, self.causal)
-        return torch.matmul(out.transpose(1, 2).reshape(B, S, self.local_q_size), self.o_proj.transpose(-1, -2))
+        return torch.matmul(
+            out.transpose(1, 2).reshape(B, S, self.local_q_size),
+            self.o_proj.transpose(-1, -2),
+        )
+
 
 # ============================================================
 # 题 13：padded <-> ragged 互转（cu_seqlens 是 FlashAttention 的输入约定）
 #   pad_to_ragged(padded, seq_lens):
-#       padded: [B, S_max, D]，seq_lens: [B] int64
+#       padded: [B, S_max, D]，seq_lens: [B] int64 2 3
 #       返回 (flat, cu_seqlens)
 #       flat: [sum(seq_lens), D]，按 batch 顺序把有效 token 拼起来
 #       cu_seqlens: [B+1] int32，前缀和，cu_seqlens[0] == 0
@@ -125,6 +142,26 @@ class TPAttention(torch.nn.Module):
 # ============================================================
 def pad_to_ragged(padded, seq_lens):
     B, S_max, D = padded.shape
-    for i in range(seq_lens):
-        padded[]
-    sum(seq_lens)
+
+    mask = torch.arange(S_max) < seq_lens.unsqueeze(1)
+    # mask = torch.zeros(B, S_max, dtype=torch.bool)
+    # for b in range(B):
+    #     for s in range(S_max):
+    #         mask[b, s] = s < seq_lens[b]
+    cu_seqlens = torch.zeros(B + 1, dtype=torch.int32)
+    cu_seqlens[1:] = torch.cumsum(seq_lens, dim=0)
+
+    return padded[mask], cu_seqlens
+
+
+def ragged_to_pad(flat: Tensor, cu_seqlens: Tensor, pad_value=0.0):
+    B = cu_seqlens.shape[0] - 1
+    D = flat.shape[1]
+
+    seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+    S_max = torch.max(seq_lens)
+    mask = torch.arange(S_max) < seq_lens.unsqueeze(1)
+
+    out = torch.full((B, S_max, D), pad_value)
+    out[mask] = flat
+    return out
