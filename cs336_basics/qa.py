@@ -125,4 +125,6 @@ class TPAttention(torch.nn.Module):
 # ============================================================
 def pad_to_ragged(padded, seq_lens):
     B, S_max, D = padded.shape
-    
+    for i in range(seq_lens):
+        padded[]
+    sum(seq_lens)
