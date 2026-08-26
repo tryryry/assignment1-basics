@@ -142,8 +142,8 @@ class TPAttention(torch.nn.Module):
 # ============================================================
 def pad_to_ragged(padded, seq_lens):
     B, S_max, D = padded.shape
+    mask = torch.arange(S_max)[None, :] < seq_lens[:, None]
 
-    mask = torch.arange(S_max) < seq_lens.unsqueeze(1)
     # mask = torch.zeros(B, S_max, dtype=torch.bool)
     # for b in range(B):
     #     for s in range(S_max):
@@ -160,8 +160,82 @@ def ragged_to_pad(flat: Tensor, cu_seqlens: Tensor, pad_value=0.0):
 
     seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
     S_max = torch.max(seq_lens)
-    mask = torch.arange(S_max) < seq_lens.unsqueeze(1)
+    mask = torch.arange(S_max)[None, :] < seq_lens[:, None]
 
     out = torch.full((B, S_max, D), pad_value)
     out[mask] = flat
     return out
+
+
+# ============================================================
+# 题 14：变长（块对角）causal attention
+#   q_flat/k_flat/v_flat: [T, H, D]，T = sum(seq_lens)，多条序列首尾拼接
+#   cu_seqlens: [B+1]
+#   语义：每个 token 只能注意到"同一条序列内且不晚于自己"的 token
+#   返回 [T, H, D]
+# 要求：不允许在 B 上写 python 循环；构造 [T, T] 的块对角 causal mask 一次算完。
+# 提示：先用 cu_seqlens 生成每个 token 的 seq_id 和序列内 position，
+#      mask = (seq_id_i == seq_id_j) & (pos_j <= pos_i)
+# ============================================================
+# flatten
+
+
+def varlen_attention(
+    q_flat: Tensor, k_flat: Tensor, v_flat: Tensor, cu_seqlens: Tensor
+) -> Tensor:
+    T, H, D = q_flat.shape
+    B = cu_seqlens.shape[0] - 1
+    score = torch.matmul(
+        q_flat.transpose(0, 1), k_flat.transpose(0, 1).transpose(-1, -2)
+    ) / (D**0.5)
+    # mask
+    seq_len = cu_seqlens[1:] - cu_seqlens[:-1]
+    # [0 0  1 1 B-1]
+    seq_id = torch.arange(B).repeat_interleave(seq_len)  # [T]
+    # [0 1 T-1] - [ 0 ]
+    seq_pos = torch.arange(T) - cu_seqlens[seq_id]  # [T]
+    # for i in range(T):
+    #     for j in range(T):
+    #         mask[i][j] = (seq_id[i] == seq_id[j]) and (seq_pos[i] >= seq_pos[j])
+    same_seq = seq_id[:, None] == seq_id[None, :]  # [T, T]
+    causal_seq = seq_pos[:, None] >= seq_pos[None, :]  # [T, T]
+    mask = same_seq & causal_seq
+    score = score.masked_fill(~mask, float("-inf"))
+
+    att = torch.softmax(score, dim=-1)
+    out = torch.matmul(att, v_flat.transpose(0, 1))
+    return out.transpose(0, 1)
+
+
+# ============================================================
+# 题 15：连续批处理 prefill 的元信息
+#   prefix_lens: [B] int64，命中前缀缓存的长度（这部分 KV 已存在，不再计算）
+#   extend_lens: [B] int64，本次需要前向的 token 数
+#   返回 (positions, extend_start_loc)
+#     positions: [sum(extend_lens)] int64，
+#                第 b 条序列贡献 prefix_lens[b] .. prefix_lens[b]+extend_lens[b]-1
+#     extend_start_loc: [B] int64，每条序列在拼接后张量里的起始下标（即 extend_lens 的
+#                       exclusive 前缀和）
+# 要求：无 python 循环。提示 repeat_interleave + arange 减去 offset。
+# ============================================================
+# prefix_lens: [2 0] extend_lens: [3 2]
+
+
+def build_position_ids(
+    prefix_lens: Tensor, extend_lens: Tensor
+) -> Tuple[Tensor, Tensor]:
+    B = prefix_lens.shape[0]
+    T = torch.sum(extend_lens)
+    extend_start_loc = (
+        torch.cumsum(extend_lens, dim=0) - extend_lens
+    )  # [3 5] - [3 2] = [0 3]
+
+    offset_id = torch.arange(B).repeat_interleave(
+        extend_lens
+    )  # [sum(extend_lens)] [0 0 0 1 1]
+    offset = torch.arange(T) - extend_lens[offset_id]  # [0 1 2 0 1]
+    pos = (
+        prefix_lens.repeat_interleave(extend_lens) + offset
+    )  # [2 2 2 0 0] + [0 1 2 0 1] = [2 3 4 0 1]
+
+    return pos, extend_start_loc
